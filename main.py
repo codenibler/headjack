@@ -20,6 +20,7 @@ APP_DIR = Path(__file__).resolve().parent
 ENV_PATH = Path(os.getenv("HEADJACK_ENV_FILE", APP_DIR / ".env"))
 ENV_EXAMPLE_PATH = APP_DIR / ".env.example"
 PROVIDER = "groq"
+MAX_COMPLETION_TOKENS = 900
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 NON_CHAPTER_ITEM_PATTERNS = (
     r"(?:^|/)(?:endnotes?|footnotes?|notes?)(?:[_-]split[_-]?\d+)?\.x?html?$",
@@ -99,6 +100,7 @@ class LLMClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
+            "max_tokens": MAX_COMPLETION_TOKENS,
             "temperature": 0.2,
         }
         estimated_tokens = estimate_prompt_tokens(system_prompt, user_prompt)
@@ -119,7 +121,8 @@ class LLMClient:
             if response.status_code in RETRYABLE_STATUS_CODES:
                 wait_seconds = retry_wait_seconds(response, attempt)
                 print(
-                    f"Groq returned HTTP {response.status_code}{rate_limit_summary(response.headers)}. "
+                    f"Groq returned HTTP {response.status_code}{rate_limit_summary(response.headers)}"
+                    f"{retryable_error_detail(response)}. "
                     f"Retrying in {format_duration(wait_seconds)}."
                 )
                 time.sleep(wait_seconds)
@@ -139,14 +142,22 @@ class LLMClient:
 
     def _wait_for_capacity(self, estimated_tokens: int) -> None:
         waits = []
+        waiting_for_requests = False
+        waiting_for_tokens = False
         if self._remaining_requests is not None and self._remaining_requests < 1:
             waits.append(self._reset_requests_seconds or 60.0)
+            waiting_for_requests = True
         if self._remaining_tokens is not None and self._remaining_tokens < estimated_tokens:
             waits.append(self._reset_tokens_seconds or 60.0)
+            waiting_for_tokens = True
         if waits:
             wait_seconds = max(waits) + 1
             print(f"Waiting {format_duration(wait_seconds)} for Groq rate-limit capacity.")
             time.sleep(wait_seconds)
+            if waiting_for_requests:
+                self._remaining_requests = None
+            if waiting_for_tokens:
+                self._remaining_tokens = None
 
     def _sleep_if_nearly_limited(self) -> None:
         waits = []
@@ -252,7 +263,7 @@ def validate_groq_config(config: Config) -> None:
 
 
 def estimate_prompt_tokens(system_prompt: str, user_prompt: str) -> int:
-    return math.ceil((len(system_prompt) + len(user_prompt)) / 4) + 500
+    return math.ceil((len(system_prompt) + len(user_prompt)) / 3) + MAX_COMPLETION_TOKENS
 
 
 def retry_wait_seconds(response: Any, attempt: int) -> float:
@@ -282,7 +293,7 @@ def parse_int_header(value: str | None) -> int | None:
     if not value:
         return None
     try:
-        return int(value)
+        return int(value.replace(",", ""))
     except ValueError:
         return None
 
@@ -342,6 +353,11 @@ def rate_limit_summary(headers: Any) -> str:
         if value is not None:
             parts.append(f"{label} remaining: {value}")
     return f" ({', '.join(parts)})" if parts else ""
+
+
+def retryable_error_detail(response: Any) -> str:
+    body = clean_text(response.text)[:300]
+    return f": {body}" if body else ""
 
 
 def groq_error_message(response: Any) -> str:
@@ -526,6 +542,8 @@ def enrich_epub(
         inject_headjack_blocks(soup, body, title, item.get_id(), summary, reflection)
         item.set_content(str(soup).encode("utf-8"))
         stats.processed += 1
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        epub.write_epub(str(output_path), book)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     epub.write_epub(str(output_path), book)
@@ -539,12 +557,19 @@ def generate_chapter_notes(
     chapter_text: str,
 ) -> tuple[str, str]:
     if prompts.get("study_notes"):
-        raw_notes = client.generate(
-            prompts["study_notes"]["system"],
-            prompts["study_notes"]["user"].format(title=title, text=chapter_text),
-        )
-        notes = parse_note_json(raw_notes)
-        return format_note_list(notes["summary"]), format_note_list(notes["reflection"])
+        for attempt in range(1, 4):
+            raw_notes = client.generate(
+                prompts["study_notes"]["system"],
+                prompts["study_notes"]["user"].format(title=title, text=chapter_text),
+            )
+            try:
+                notes = parse_note_json(raw_notes)
+                return format_note_list(notes["summary"]), format_note_list(notes["reflection"])
+            except (json.JSONDecodeError, ValueError) as exc:
+                if attempt == 3:
+                    print(f"Groq returned invalid JSON for {title}; falling back to separate prompts.")
+                    break
+                print(f"Groq returned invalid JSON for {title}: {exc}. Retrying.")
 
     summary = client.generate(
         prompts["summary"]["system"],
@@ -562,11 +587,22 @@ def parse_note_json(raw: str) -> dict[str, list[str]]:
     if clean.startswith("```"):
         clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", clean, flags=re.IGNORECASE)
 
-    data = json.loads(clean)
+    data = json.loads(extract_json_object(clean))
     return {
         "summary": normalize_note_list(data.get("summary")),
         "reflection": normalize_note_list(data.get("reflection")),
     }
+
+
+def extract_json_object(text: str) -> str:
+    clean = text.strip()
+    if clean.startswith("{") and clean.endswith("}"):
+        return clean
+    start = clean.find("{")
+    end = clean.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return clean
+    return clean[start : end + 1]
 
 
 def normalize_note_list(value: Any) -> list[str]:
