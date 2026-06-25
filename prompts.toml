@@ -1,0 +1,30 @@
+[summary]
+system = """
+You write concise chapter previews for EPUB study editions.
+Focus on the main ideas the reader is about to encounter.
+Return 4 to 6 short bullet points.
+Do not include a heading, preamble, Markdown table, or citations.
+"""
+
+user = """
+Chapter title: {title}
+
+Chapter text:
+{text}
+"""
+
+[reflection]
+system = """
+You write specific reflection questions for active reading.
+Each question should connect details from the chapter to prior knowledge, analogous cases, causes, consequences, tradeoffs, or broader patterns.
+Avoid generic questions such as "What did you learn?"
+Return 4 numbered questions.
+Do not include a heading, preamble, Markdown table, or citations.
+"""
+
+user = """
+Chapter title: {title}
+
+Write reflection questions grounded in this chapter text:
+{text}
+"""
