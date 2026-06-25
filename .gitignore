@@ -1,5 +1,6 @@
 __pycache__/
 .venv/
 venv/
-*_sq3r.epub
-*_sq3r_*.epub
+.env
+*_headjack.epub
+*_headjack_*.epub

@@ -2,73 +2,52 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import email.utils
 import json
+import math
 import os
+import random
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
-DEFAULT_PROMPTS = Path(__file__).with_name("prompts.toml")
-DEFAULT_OLLAMA_URL = "http://localhost:11434"
-DEFAULT_PROVIDER = "groq"
-DEFAULT_MODELS = {
-    "groq": "llama-3.3-70b-versatile",
-    "huggingface": "openai/gpt-oss-120b:cerebras",
-    "ollama": "llama3.2:3b",
-    "openai-compatible": "provider/model-name",
-    "none": "none",
-}
-DEFAULT_API_BASES = {
-    "groq": "https://api.groq.com/openai/v1",
-    "huggingface": "https://router.huggingface.co/v1",
-    "ollama": DEFAULT_OLLAMA_URL,
-    "openai-compatible": "https://example.com/v1",
-    "none": "",
-}
-
-# Don't add SQ3R to these chapters
-SKIP_WORDS = (
-    "about the author",
-    "acknowledgement",
-    "acknowledgment",
-    "afterword",
-    "appendix",
-    "bibliography",
-    "conclusion",
-    "contents",
-    "copyright",
-    "dedication",
-    "epilogue",
-    "foreword",
-    "glossary",
-    "index",
-    "introduction",
-    "notes",
-    "preface",
-    "prologue",
-    "references",
-    "title page",
-    "toc",
+APP_DIR = Path(__file__).resolve().parent
+ENV_PATH = Path(os.getenv("HEADJACK_ENV_FILE", APP_DIR / ".env"))
+ENV_EXAMPLE_PATH = APP_DIR / ".env.example"
+PROVIDER = "groq"
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+NON_CHAPTER_ITEM_PATTERNS = (
+    r"(?:^|/)(?:endnotes?|footnotes?|notes?)(?:[_-]split[_-]?\d+)?\.x?html?$",
+    r"(?:^|/)insert[_-]split[_-]?\d+\.x?html?$",
+    r"(?:^|/)(?:ack|acknowledg\w*|authorbio|bibliography|copyright|cover|glossary|index|nav|toc)\w*\.x?html?$",
+)
+NON_CHAPTER_TITLE_PATTERNS = (
+    r"\bmore praise\b",
+    r"\bpraise for\b",
+    r"\bcast of characters\b",
+    r"\backnowledgments?\b",
 )
 
 STYLE = """
-.ksq3r-panel {
+.headjack-panel {
   border: 1px solid #888;
   margin: 1.2em 0;
   padding: 0.9em;
 }
-.ksq3r-panel h2 {
+.headjack-panel h2 {
   font-size: 1.2em;
   margin: 0 0 0.6em 0;
 }
-.ksq3r-link {
+.headjack-link {
   display: block;
   margin: 0.8em 0;
 }
-.ksq3r-lines p {
+.headjack-lines p {
   border-bottom: 1px solid #999;
   min-height: 1.7em;
   margin: 0.4em 0;
@@ -78,7 +57,6 @@ STYLE = """
 
 @dataclass(frozen=True)
 class Config:
-    provider: str
     model: str
     api_base: str
     api_key: str | None
@@ -88,6 +66,7 @@ class Config:
     timeout: int
     output_dir: Path | None
     overwrite: bool
+    skip_words: tuple[str, ...]
 
 
 @dataclass
@@ -100,34 +79,12 @@ class BookStats:
 class LLMClient:
     def __init__(self, config: Config) -> None:
         self.config = config
+        self._remaining_requests: int | None = None
+        self._remaining_tokens: int | None = None
+        self._reset_requests_seconds: float | None = None
+        self._reset_tokens_seconds: float | None = None
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
-        if self.config.provider == "ollama":
-            return self._ollama(system_prompt, user_prompt)
-        if self.config.provider in ("groq", "huggingface", "openai-compatible"):
-            return self._openai_compatible(system_prompt, user_prompt)
-        if self.config.provider == "none":
-            return "LLM generation disabled for this run."
-        raise ValueError(f"Unsupported provider: {self.config.provider}")
-
-    def _ollama(self, system_prompt: str, user_prompt: str) -> str:
-        import requests
-
-        response = requests.post(
-            f"{self.config.api_base.rstrip('/')}/api/generate",
-            json={
-                "model": self.config.model,
-                "system": system_prompt,
-                "prompt": user_prompt,
-                "stream": False,
-                "options": {"temperature": 0.2},
-            },
-            timeout=self.config.timeout,
-        )
-        response.raise_for_status()
-        return response.json()["response"].strip()
-
-    def _openai_compatible(self, system_prompt: str, user_prompt: str) -> str:
         import requests
 
         base = self.config.api_base.rstrip("/")
@@ -136,27 +93,79 @@ class LLMClient:
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
 
-        response = requests.post(
-            url,
-            headers=headers,
-            json={
-                "model": self.config.model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.2,
-            },
-            timeout=self.config.timeout,
-        )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"].strip()
+        payload = {
+            "model": self.config.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.2,
+        }
+        estimated_tokens = estimate_prompt_tokens(system_prompt, user_prompt)
+
+        attempt = 0
+        while True:
+            attempt += 1
+            self._wait_for_capacity(estimated_tokens)
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=self.config.timeout)
+            except requests.RequestException as exc:
+                wait_seconds = retry_backoff_seconds(attempt)
+                print(f"Groq request failed: {exc}. Retrying in {format_duration(wait_seconds)}.")
+                time.sleep(wait_seconds)
+                continue
+
+            self._update_rate_limits(response.headers)
+            if response.status_code in RETRYABLE_STATUS_CODES:
+                wait_seconds = retry_wait_seconds(response, attempt)
+                print(
+                    f"Groq returned HTTP {response.status_code}{rate_limit_summary(response.headers)}. "
+                    f"Retrying in {format_duration(wait_seconds)}."
+                )
+                time.sleep(wait_seconds)
+                continue
+
+            if response.status_code >= 400:
+                raise RuntimeError(groq_error_message(response))
+
+            self._sleep_if_nearly_limited()
+            return response.json()["choices"][0]["message"]["content"].strip()
+
+    def _update_rate_limits(self, headers: Any) -> None:
+        self._remaining_requests = parse_int_header(headers.get("x-ratelimit-remaining-requests"))
+        self._remaining_tokens = parse_int_header(headers.get("x-ratelimit-remaining-tokens"))
+        self._reset_requests_seconds = parse_delay_header(headers.get("x-ratelimit-reset-requests"))
+        self._reset_tokens_seconds = parse_delay_header(headers.get("x-ratelimit-reset-tokens"))
+
+    def _wait_for_capacity(self, estimated_tokens: int) -> None:
+        waits = []
+        if self._remaining_requests is not None and self._remaining_requests < 1:
+            waits.append(self._reset_requests_seconds or 60.0)
+        if self._remaining_tokens is not None and self._remaining_tokens < estimated_tokens:
+            waits.append(self._reset_tokens_seconds or 60.0)
+        if waits:
+            wait_seconds = max(waits) + 1
+            print(f"Waiting {format_duration(wait_seconds)} for Groq rate-limit capacity.")
+            time.sleep(wait_seconds)
+
+    def _sleep_if_nearly_limited(self) -> None:
+        waits = []
+        if self._remaining_requests is not None and self._remaining_requests <= 1:
+            waits.append(self._reset_requests_seconds or 60.0)
+        if self._remaining_tokens is not None and self._remaining_tokens <= 1000:
+            waits.append(self._reset_tokens_seconds or 60.0)
+        if waits:
+            wait_seconds = max(waits) + 1
+            print(f"Waiting {format_duration(wait_seconds)} for Groq rate-limit reset.")
+            time.sleep(wait_seconds)
 
 
 def main() -> int:
+    load_env(ENV_PATH)
+    load_env(ENV_EXAMPLE_PATH)
     args = parse_args()
     config = build_config(args)
-    validate_provider_config(config)
+    validate_groq_config(config)
     require_dependencies()
     epub_paths = [Path(path).expanduser() for path in args.epubs] or pick_epubs()
 
@@ -184,74 +193,240 @@ def parse_args() -> argparse.Namespace:
         description="Select EPUBs and add SQ3R summary, question, and reflection blocks."
     )
     parser.add_argument("epubs", nargs="*", help="EPUB files. Omit to open a file picker.")
-    parser.add_argument("--prompts", default=str(DEFAULT_PROMPTS), help="Path to prompts TOML.")
     parser.add_argument(
-        "--provider",
-        choices=("groq", "huggingface", "ollama", "openai-compatible", "none"),
-        default=os.getenv("KSQ3R_PROVIDER", DEFAULT_PROVIDER),
-        help="LLM API provider. Defaults to Groq.",
+        "--prompts",
+        default=setting_required("HEADJACK_PROMPTS"),
+        help="Path to prompts TOML.",
     )
-    parser.add_argument("--model", default=os.getenv("KSQ3R_MODEL"))
+    parser.add_argument("--model", default=setting("HEADJACK_MODEL"))
     parser.add_argument(
         "--api-base",
-        default=os.getenv("KSQ3R_API_BASE"),
-        help="Provider base URL. Defaults depend on --provider.",
+        default=setting("HEADJACK_API_BASE"),
+        help="Groq API base URL.",
     )
-    parser.add_argument("--api-key", default=os.getenv("KSQ3R_API_KEY"))
-    parser.add_argument("--max-chars", type=int, default=int(os.getenv("KSQ3R_MAX_CHARS", "28000")))
+    parser.add_argument("--api-key", default="")
+    parser.add_argument("--max-chars", type=int, default=setting_int("HEADJACK_MAX_CHARS"))
     parser.add_argument(
         "--min-chapter-chars",
         type=int,
-        default=int(os.getenv("KSQ3R_MIN_CHAPTER_CHARS", "900")),
+        default=setting_int("HEADJACK_MIN_CHAPTER_CHARS"),
         help="Skip likely front/back matter and fragments shorter than this.",
     )
-    parser.add_argument("--timeout", type=int, default=int(os.getenv("KSQ3R_TIMEOUT", "180")))
-    parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--overwrite", action="store_true", help="Overwrite each source EPUB.")
+    parser.add_argument("--timeout", type=int, default=setting_int("HEADJACK_TIMEOUT"))
+    parser.add_argument("--output-dir", type=Path, default=optional_path("HEADJACK_OUTPUT_DIR"))
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        default=setting_bool("HEADJACK_OVERWRITE"),
+        help="Overwrite each source EPUB.",
+    )
     return parser.parse_args()
 
 
 def build_config(args: argparse.Namespace) -> Config:
-    provider = args.provider
-    api_base = args.api_base or DEFAULT_API_BASES[provider]
-    model = args.model or DEFAULT_MODELS[provider]
-    api_key = args.api_key or provider_api_key(provider)
+    api_base = args.api_base or groq_setting("API_BASE")
+    model = args.model or groq_setting("MODEL")
+    api_key = args.api_key or setting("GROQ_API_KEY")
 
-    if provider == "openai-compatible" and api_base == DEFAULT_API_BASES[provider]:
-        api_base = os.getenv("OPENAI_BASE_URL", api_base)
     return Config(
-        provider=provider,
         model=model,
         api_base=api_base,
         api_key=api_key,
-        prompts_path=Path(args.prompts).expanduser(),
+        prompts_path=project_path(args.prompts),
         max_chars=args.max_chars,
         min_chapter_chars=args.min_chapter_chars,
         timeout=args.timeout,
         output_dir=args.output_dir,
         overwrite=args.overwrite,
+        skip_words=csv_setting("HEADJACK_SKIP_WORDS"),
     )
 
 
-def provider_api_key(provider: str) -> str | None:
-    if provider == "groq":
-        return os.getenv("GROQ_API_KEY")
-    if provider == "huggingface":
-        return os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
-    return os.getenv("OPENAI_API_KEY")
+def validate_groq_config(config: Config) -> None:
+    if not config.model:
+        raise SystemExit("Missing Groq model. Set HEADJACK_GROQ_MODEL.")
+    if not config.api_base:
+        raise SystemExit("Missing Groq API base. Set HEADJACK_GROQ_API_BASE.")
+    if not config.api_key:
+        raise SystemExit("Missing Groq API key. Set GROQ_API_KEY or pass --api-key.")
 
 
-def validate_provider_config(config: Config) -> None:
-    if config.provider in ("groq", "huggingface", "openai-compatible") and not config.api_key:
-        env_vars = {
-            "groq": "GROQ_API_KEY",
-            "huggingface": "HF_TOKEN",
-            "openai-compatible": "KSQ3R_API_KEY",
-        }
-        raise SystemExit(
-            f"Missing API key for {config.provider}. Set {env_vars[config.provider]} "
-            "or pass --api-key."
+def estimate_prompt_tokens(system_prompt: str, user_prompt: str) -> int:
+    return math.ceil((len(system_prompt) + len(user_prompt)) / 4) + 500
+
+
+def retry_wait_seconds(response: Any, attempt: int) -> float:
+    explicit_wait = parse_delay_header(response.headers.get("retry-after"))
+    if explicit_wait is not None:
+        return explicit_wait + 1
+
+    reset_waits = [
+        wait
+        for wait in (
+            parse_delay_header(response.headers.get("x-ratelimit-reset-requests")),
+            parse_delay_header(response.headers.get("x-ratelimit-reset-tokens")),
+            parse_delay_from_text(response.text),
         )
+        if wait is not None
+    ]
+    if reset_waits:
+        return max(reset_waits) + 1
+    return retry_backoff_seconds(attempt)
+
+
+def retry_backoff_seconds(attempt: int) -> float:
+    return min(300.0, 2.0 ** min(attempt, 8)) + random.uniform(0.0, 1.0)
+
+
+def parse_int_header(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def parse_delay_header(value: str | None) -> float | None:
+    if not value:
+        return None
+
+    raw = value.strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+
+    try:
+        parsed_date = email.utils.parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        parsed_date = None
+    if parsed_date is not None:
+        if parsed_date.tzinfo is None:
+            parsed_date = parsed_date.replace(tzinfo=dt.timezone.utc)
+        return max(0.0, (parsed_date - dt.datetime.now(dt.timezone.utc)).total_seconds())
+
+    total = 0.0
+    matches = list(re.finditer(r"(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)\b", raw, flags=re.IGNORECASE))
+    if not matches:
+        return None
+    multipliers = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
+    for match in matches:
+        total += float(match.group(1)) * multipliers[match.group(2).lower()]
+    return max(0.0, total)
+
+
+def parse_delay_from_text(text: str) -> float | None:
+    match = re.search(r"try again in\s+([0-9a-zA-Z.\s]+)", text, flags=re.IGNORECASE)
+    return parse_delay_header(match.group(1)) if match else None
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {seconds}s"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def rate_limit_summary(headers: Any) -> str:
+    parts = []
+    for label, name in (
+        ("requests", "x-ratelimit-remaining-requests"),
+        ("tokens", "x-ratelimit-remaining-tokens"),
+    ):
+        value = headers.get(name)
+        if value is not None:
+            parts.append(f"{label} remaining: {value}")
+    return f" ({', '.join(parts)})" if parts else ""
+
+
+def groq_error_message(response: Any) -> str:
+    body = clean_text(response.text)[:500]
+    detail = f": {body}" if body else ""
+    return f"Groq HTTP {response.status_code}{detail}"
+
+
+def load_env(path: Path) -> None:
+    if not path.exists():
+        return
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parsed = parse_env_line(line)
+        if parsed:
+            key, value = parsed
+            os.environ.setdefault(key, value)
+
+
+def parse_env_line(line: str) -> tuple[str, str] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    if stripped.startswith("export "):
+        stripped = stripped[7:].strip()
+    if "=" not in stripped:
+        return None
+
+    key, value = stripped.split("=", 1)
+    key = key.strip()
+    value = value.strip()
+    if not key:
+        return None
+
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1]
+    else:
+        value = value.split(" #", 1)[0].strip()
+    return key, value
+
+
+def setting(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip() or default
+
+
+def setting_required(name: str) -> str:
+    value = setting(name)
+    if not value:
+        raise SystemExit(f"Missing required setting {name}. Add it to .env.")
+    return value
+
+
+def setting_int(name: str) -> int:
+    raw = setting_required(name)
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be an integer, got {raw!r}.") from exc
+
+
+def setting_bool(name: str) -> bool:
+    raw = setting_required(name).lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise SystemExit(f"{name} must be true or false, got {raw!r}.")
+
+
+def csv_setting(name: str) -> tuple[str, ...]:
+    return tuple(value.strip().lower() for value in setting(name).split(",") if value.strip())
+
+
+def groq_setting(field: str) -> str:
+    return setting(f"HEADJACK_{PROVIDER.upper()}_{field}")
+
+
+def optional_path(name: str) -> Path | None:
+    value = setting(name)
+    return project_path(value) if value else None
+
+
+def project_path(value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else APP_DIR / path
 
 
 def pick_epubs() -> list[Path]:
@@ -337,18 +512,18 @@ def enrich_epub(
         text = clean_text(body.get_text(" ", strip=True))
         title = chapter_title(soup, item.get_name())
 
-        if body.find(attrs={"data-ksq3r": "summary"}):
+        if body.find(attrs={"data-headjack": "summary"}):
             stats.already_enriched += 1
             continue
-        if should_skip_chapter(title, item.get_name(), text, config.min_chapter_chars):
+        if should_skip_chapter(title, item.get_name(), text, config.min_chapter_chars, config.skip_words):
             stats.skipped += 1
             continue
 
-        print(f"Generating SQ3R blocks for: {title}")
         chapter_text = trim_text(text, config.max_chars)
+        print(f"Generating SQ3R blocks for: {title} ({len(chapter_text):,}/{len(text):,} chars)")
         summary, reflection = generate_chapter_notes(client, prompts, title, chapter_text)
 
-        inject_sq3r_blocks(soup, body, title, item.get_id(), summary, reflection)
+        inject_headjack_blocks(soup, body, title, item.get_id(), summary, reflection)
         item.set_content(str(soup).encode("utf-8"))
         stats.processed += 1
 
@@ -438,11 +613,27 @@ def chapter_title(soup: Any, item_name: str) -> str:
     return Path(item_name).stem.replace("_", " ").replace("-", " ").title()
 
 
-def should_skip_chapter(title: str, item_name: str, text: str, min_chars: int) -> bool:
+def should_skip_chapter(
+    title: str,
+    item_name: str,
+    text: str,
+    min_chars: int,
+    skip_words: tuple[str, ...],
+) -> bool:
     haystack = f"{title} {item_name}".lower()
     if len(text) < min_chars:
         return True
-    return any(re.search(rf"\b{re.escape(word)}\b", haystack) for word in SKIP_WORDS)
+    if is_non_chapter_item(title, item_name):
+        return True
+    return any(re.search(rf"\b{re.escape(word)}\b", haystack) for word in skip_words)
+
+
+def is_non_chapter_item(title: str, item_name: str) -> bool:
+    item_path = item_name.lower()
+    title_text = title.lower()
+    return any(re.search(pattern, item_path) for pattern in NON_CHAPTER_ITEM_PATTERNS) or any(
+        re.search(pattern, title_text) for pattern in NON_CHAPTER_TITLE_PATTERNS
+    )
 
 
 def trim_text(text: str, max_chars: int) -> str:
@@ -452,7 +643,7 @@ def trim_text(text: str, max_chars: int) -> str:
     return f"{text[:half]}\n\n[Middle of chapter omitted for length]\n\n{text[-half:]}"
 
 
-def inject_sq3r_blocks(
+def inject_headjack_blocks(
     soup: Any,
     body: Any,
     title: str,
@@ -461,18 +652,18 @@ def inject_sq3r_blocks(
     reflection: str,
 ) -> None:
     safe_id = slug(item_id or title)
-    start_id = f"ksq3r-start-{safe_id}"
-    questions_id = f"ksq3r-questions-{safe_id}"
+    start_id = f"headjack-start-{safe_id}"
+    questions_id = f"headjack-questions-{safe_id}"
 
     add_style(soup)
 
     start_anchor = soup.new_tag("a", id=start_id)
-    start_anchor["data-ksq3r"] = "chapter-start"
+    start_anchor["data-headjack"] = "chapter-start"
 
     summary_panel = panel(soup, "Chapter Preview", "summary")
     summary_panel.append(render_lines(soup, summary, ordered=False))
 
-    jump_link = soup.new_tag("a", href=f"#{questions_id}", **{"class": "ksq3r-link"})
+    jump_link = soup.new_tag("a", href=f"#{questions_id}", **{"class": "headjack-link"})
     jump_link.string = "Jump to the question space at the end of this chapter"
 
     for node in reversed((start_anchor, summary_panel, jump_link)):
@@ -483,7 +674,7 @@ def inject_sq3r_blocks(
     prompt.string = "Leave questions here before reading, then return to the beginning."
     questions_panel.append(prompt)
 
-    lines = soup.new_tag("div", **{"class": "ksq3r-lines"})
+    lines = soup.new_tag("div", **{"class": "headjack-lines"})
     for _ in range(6):
         lines.append(soup.new_tag("p"))
     questions_panel.append(lines)
@@ -491,11 +682,11 @@ def inject_sq3r_blocks(
     reflection_panel = panel(soup, "Reflect", "reflection")
     reflection_panel.append(render_lines(soup, reflection, ordered=True))
 
-    back_link = soup.new_tag("a", href=f"#{start_id}", **{"class": "ksq3r-link"})
+    back_link = soup.new_tag("a", href=f"#{start_id}", **{"class": "headjack-link"})
     back_link.string = "Return to the beginning of this chapter"
 
     end_anchor = soup.new_tag("a", id=questions_id)
-    end_anchor["data-ksq3r"] = "chapter-end"
+    end_anchor["data-headjack"] = "chapter-end"
     body.append(end_anchor)
     body.append(questions_panel)
     body.append(reflection_panel)
@@ -510,16 +701,16 @@ def add_style(soup: Any) -> None:
             soup.html.insert(0, head)
         else:
             soup.insert(0, head)
-    if head.find("style", id="ksq3r-style"):
+    if head.find("style", id="headjack-style"):
         return
-    style = soup.new_tag("style", id="ksq3r-style")
+    style = soup.new_tag("style", id="headjack-style")
     style.string = STYLE
     head.append(style)
 
 
 def panel(soup: Any, title: str, kind: str) -> Any:
-    section = soup.new_tag("section", **{"class": "ksq3r-panel"})
-    section["data-ksq3r"] = kind
+    section = soup.new_tag("section", **{"class": "headjack-panel"})
+    section["data-headjack"] = kind
     heading = soup.new_tag("h2")
     heading.string = title
     section.append(heading)
@@ -563,10 +754,10 @@ def choose_output_path(epub_path: Path, config: Config) -> Path:
         return epub_path
 
     directory = config.output_dir or epub_path.parent
-    candidate = directory / f"{epub_path.stem}_sq3r{epub_path.suffix}"
+    candidate = directory / f"{epub_path.stem}_headjack{epub_path.suffix}"
     counter = 2
     while candidate.exists():
-        candidate = directory / f"{epub_path.stem}_sq3r_{counter}{epub_path.suffix}"
+        candidate = directory / f"{epub_path.stem}_headjack_{counter}{epub_path.suffix}"
         counter += 1
     return candidate
 
