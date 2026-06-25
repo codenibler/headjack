@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -12,7 +13,21 @@ from typing import Any
 
 DEFAULT_PROMPTS = Path(__file__).with_name("prompts.toml")
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
-DEFAULT_MODEL = "llama3.2:3b"
+DEFAULT_PROVIDER = "groq"
+DEFAULT_MODELS = {
+    "groq": "llama-3.3-70b-versatile",
+    "huggingface": "openai/gpt-oss-120b:cerebras",
+    "ollama": "llama3.2:3b",
+    "openai-compatible": "provider/model-name",
+    "none": "none",
+}
+DEFAULT_API_BASES = {
+    "groq": "https://api.groq.com/openai/v1",
+    "huggingface": "https://router.huggingface.co/v1",
+    "ollama": DEFAULT_OLLAMA_URL,
+    "openai-compatible": "https://example.com/v1",
+    "none": "",
+}
 
 # Don't add SQ3R to these chapters
 SKIP_WORDS = (
@@ -89,7 +104,7 @@ class LLMClient:
     def generate(self, system_prompt: str, user_prompt: str) -> str:
         if self.config.provider == "ollama":
             return self._ollama(system_prompt, user_prompt)
-        if self.config.provider == "openai-compatible":
+        if self.config.provider in ("groq", "huggingface", "openai-compatible"):
             return self._openai_compatible(system_prompt, user_prompt)
         if self.config.provider == "none":
             return "LLM generation disabled for this run."
@@ -141,13 +156,14 @@ class LLMClient:
 def main() -> int:
     args = parse_args()
     config = build_config(args)
+    validate_provider_config(config)
+    require_dependencies()
     epub_paths = [Path(path).expanduser() for path in args.epubs] or pick_epubs()
 
     if not epub_paths:
         print("No EPUB files selected.")
         return 1
 
-    require_dependencies()
     prompts = load_prompts(config.prompts_path)
     client = LLMClient(config)
 
@@ -171,18 +187,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompts", default=str(DEFAULT_PROMPTS), help="Path to prompts TOML.")
     parser.add_argument(
         "--provider",
-        choices=("ollama", "openai-compatible", "none"),
-        default=os.getenv("KSQ3R_PROVIDER", "ollama"),
-        help="LLM API provider. Defaults to local Ollama.",
+        choices=("groq", "huggingface", "ollama", "openai-compatible", "none"),
+        default=os.getenv("KSQ3R_PROVIDER", DEFAULT_PROVIDER),
+        help="LLM API provider. Defaults to Groq.",
     )
-    parser.add_argument("--model", default=os.getenv("KSQ3R_MODEL", DEFAULT_MODEL))
+    parser.add_argument("--model", default=os.getenv("KSQ3R_MODEL"))
     parser.add_argument(
         "--api-base",
-        default=os.getenv("KSQ3R_API_BASE", DEFAULT_OLLAMA_URL),
-        help="Ollama base URL or OpenAI-compatible chat-completions base URL.",
+        default=os.getenv("KSQ3R_API_BASE"),
+        help="Provider base URL. Defaults depend on --provider.",
     )
     parser.add_argument("--api-key", default=os.getenv("KSQ3R_API_KEY"))
-    parser.add_argument("--max-chars", type=int, default=int(os.getenv("KSQ3R_MAX_CHARS", "14000")))
+    parser.add_argument("--max-chars", type=int, default=int(os.getenv("KSQ3R_MAX_CHARS", "28000")))
     parser.add_argument(
         "--min-chapter-chars",
         type=int,
@@ -196,14 +212,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_config(args: argparse.Namespace) -> Config:
-    api_base = args.api_base
-    if args.provider == "openai-compatible" and api_base == DEFAULT_OLLAMA_URL:
+    provider = args.provider
+    api_base = args.api_base or DEFAULT_API_BASES[provider]
+    model = args.model or DEFAULT_MODELS[provider]
+    api_key = args.api_key or provider_api_key(provider)
+
+    if provider == "openai-compatible" and api_base == DEFAULT_API_BASES[provider]:
         api_base = os.getenv("OPENAI_BASE_URL", api_base)
     return Config(
-        provider=args.provider,
-        model=args.model,
+        provider=provider,
+        model=model,
         api_base=api_base,
-        api_key=args.api_key,
+        api_key=api_key,
         prompts_path=Path(args.prompts).expanduser(),
         max_chars=args.max_chars,
         min_chapter_chars=args.min_chapter_chars,
@@ -211,6 +231,27 @@ def build_config(args: argparse.Namespace) -> Config:
         output_dir=args.output_dir,
         overwrite=args.overwrite,
     )
+
+
+def provider_api_key(provider: str) -> str | None:
+    if provider == "groq":
+        return os.getenv("GROQ_API_KEY")
+    if provider == "huggingface":
+        return os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+    return os.getenv("OPENAI_API_KEY")
+
+
+def validate_provider_config(config: Config) -> None:
+    if config.provider in ("groq", "huggingface", "openai-compatible") and not config.api_key:
+        env_vars = {
+            "groq": "GROQ_API_KEY",
+            "huggingface": "HF_TOKEN",
+            "openai-compatible": "KSQ3R_API_KEY",
+        }
+        raise SystemExit(
+            f"Missing API key for {config.provider}. Set {env_vars[config.provider]} "
+            "or pass --api-key."
+        )
 
 
 def pick_epubs() -> list[Path]:
@@ -258,10 +299,13 @@ def load_prompts(path: Path) -> dict[str, Any]:
     with path.open("rb") as handle:
         prompts = tomllib.load(handle)
 
+    if prompts.get("study_notes", {}).get("system") and prompts.get("study_notes", {}).get("user"):
+        return prompts
+
     for section in ("summary", "reflection"):
         for key in ("system", "user"):
             if not prompts.get(section, {}).get(key):
-                raise ValueError(f"Missing [{section}].{key} in {path}")
+                raise ValueError(f"Missing [{section}].{key} or [study_notes].{key} in {path}")
     return prompts
 
 
@@ -302,14 +346,7 @@ def enrich_epub(
 
         print(f"Generating SQ3R blocks for: {title}")
         chapter_text = trim_text(text, config.max_chars)
-        summary = client.generate(
-            prompts["summary"]["system"],
-            prompts["summary"]["user"].format(title=title, text=chapter_text),
-        )
-        reflection = client.generate(
-            prompts["reflection"]["system"],
-            prompts["reflection"]["user"].format(title=title, text=chapter_text),
-        )
+        summary, reflection = generate_chapter_notes(client, prompts, title, chapter_text)
 
         inject_sq3r_blocks(soup, body, title, item.get_id(), summary, reflection)
         item.set_content(str(soup).encode("utf-8"))
@@ -318,6 +355,58 @@ def enrich_epub(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     epub.write_epub(str(output_path), book)
     return stats
+
+
+def generate_chapter_notes(
+    client: LLMClient,
+    prompts: dict[str, Any],
+    title: str,
+    chapter_text: str,
+) -> tuple[str, str]:
+    if prompts.get("study_notes"):
+        raw_notes = client.generate(
+            prompts["study_notes"]["system"],
+            prompts["study_notes"]["user"].format(title=title, text=chapter_text),
+        )
+        notes = parse_note_json(raw_notes)
+        return format_note_list(notes["summary"]), format_note_list(notes["reflection"])
+
+    summary = client.generate(
+        prompts["summary"]["system"],
+        prompts["summary"]["user"].format(title=title, text=chapter_text),
+    )
+    reflection = client.generate(
+        prompts["reflection"]["system"],
+        prompts["reflection"]["user"].format(title=title, text=chapter_text),
+    )
+    return summary, reflection
+
+
+def parse_note_json(raw: str) -> dict[str, list[str]]:
+    clean = raw.strip()
+    if clean.startswith("```"):
+        clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", clean, flags=re.IGNORECASE)
+
+    data = json.loads(clean)
+    return {
+        "summary": normalize_note_list(data.get("summary")),
+        "reflection": normalize_note_list(data.get("reflection")),
+    }
+
+
+def normalize_note_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        lines = [clean_text(str(item)) for item in value]
+    else:
+        lines = [strip_list_marker(line) for line in str(value or "").splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        raise ValueError("The model response did not include usable study notes.")
+    return lines
+
+
+def format_note_list(lines: list[str]) -> str:
+    return "\n".join(lines)
 
 
 def spine_item_ids(book: Any) -> list[str]:

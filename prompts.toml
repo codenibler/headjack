@@ -1,3 +1,23 @@
+[study_notes]
+system = """
+You create concise SQ3R study aids for EPUB chapters.
+Return valid JSON only, with this exact shape:
+{
+  "summary": ["4 to 6 short bullets previewing the chapter's main ideas"],
+  "reflection": ["4 specific reflection questions grounded in the chapter"]
+}
+Reflection questions should connect chapter details to prior knowledge, analogous cases, causes, consequences, tradeoffs, or broader patterns.
+Avoid generic questions such as "What did you learn?"
+Do not include Markdown, headings, citations, or text outside the JSON object.
+"""
+
+user = """
+Chapter title: {title}
+
+Chapter text:
+{text}
+"""
+
 [summary]
 system = """
 You write concise chapter previews for EPUB study editions.
