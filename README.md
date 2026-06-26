@@ -47,4 +47,3 @@ HEADJACK_MAX_CHARS=50000 # Truncated to beginning and end of chapter if greater 
 HEADJACK_OUTPUT_DIR=/Users/codenibler/Desktop/sq3r-output
 HEADJACK_OVERWRITE=false
 ```
-
