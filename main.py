@@ -48,10 +48,17 @@ STYLE = """
   display: block;
   margin: 0.8em 0;
 }
-.headjack-lines p {
+.headjack-qa-block {
+  margin: 0.9em 0;
+}
+.headjack-qa-label {
+  font-weight: bold;
+  margin: 0.5em 0 0.2em 0;
+}
+.headjack-qa-lines p {
   border-bottom: 1px solid #999;
   min-height: 1.7em;
-  margin: 0.4em 0;
+  margin: 0.3em 0;
 }
 """
 
@@ -707,13 +714,10 @@ def inject_headjack_blocks(
 
     questions_panel = panel(soup, "Questions", "questions")
     prompt = soup.new_tag("p")
-    prompt.string = "Leave questions here before reading, then return to the beginning."
+    prompt.string = "Use Q rows for questions before reading and A rows for answers after reading."
     questions_panel.append(prompt)
 
-    lines = soup.new_tag("div", **{"class": "headjack-lines"})
-    for _ in range(6):
-        lines.append(soup.new_tag("p"))
-    questions_panel.append(lines)
+    questions_panel.append(render_question_answer_blocks(soup))
 
     reflection_panel = panel(soup, "Reflect", "reflection")
     reflection_panel.append(render_lines(soup, reflection, ordered=True))
@@ -727,6 +731,31 @@ def inject_headjack_blocks(
     body.append(questions_panel)
     body.append(reflection_panel)
     body.append(back_link)
+
+
+def render_question_answer_blocks(soup: Any) -> Any:
+    container = soup.new_tag("div", **{"class": "headjack-qa-blocks"})
+    for index in range(1, 4):
+        block = soup.new_tag("div", **{"class": "headjack-qa-block"})
+        block.append(qa_label(soup, f"Q{index}"))
+        block.append(blank_lines(soup, 1))
+        block.append(qa_label(soup, f"A{index}"))
+        block.append(blank_lines(soup, 2))
+        container.append(block)
+    return container
+
+
+def qa_label(soup: Any, label: str) -> Any:
+    paragraph = soup.new_tag("p", **{"class": "headjack-qa-label"})
+    paragraph.string = label
+    return paragraph
+
+
+def blank_lines(soup: Any, count: int) -> Any:
+    lines = soup.new_tag("div", **{"class": "headjack-qa-lines"})
+    for _ in range(count):
+        lines.append(soup.new_tag("p"))
+    return lines
 
 
 def add_style(soup: Any) -> None:
